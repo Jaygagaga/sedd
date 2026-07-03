@@ -1,0 +1,54 @@
+defaults:
+  - base
+  - _self_
+  - override hydra/launcher: basic
+
+ngpus: 1
+
+training:
+  batch_size: 4
+  accum: 2
+  n_iters: 0
+  epochs: 5
+  snapshot_freq: 1
+  log_freq: 10
+  eval_freq: 1
+  snapshot_freq_for_preemption: 1
+  snapshot_sampling: False
+  target_only_diffusion: True
+  early_stopping_patience: 2
+
+data:
+  task_type: sft
+  dataset_name: simplescaling/s1K-1.1
+  prompt_field: question
+  target_field: solution
+  answer_field: null
+  num_workers: 0
+  pin_memory: False
+  persistent_workers: False
+  max_length: 512
+  split_seed: 42
+
+sampling:
+  predictor: analytic
+  steps: 128
+  noise_removal: True
+  prompt_clamp: True
+
+eval:
+  batch_size: 16
+  perplexity: False
+  answer_extraction: heuristic
+
+optim:
+  lr: 1e-5
+
+model:
+  length: 512
+
+hydra:
+  run:
+    dir: exp_local/sft/${now:%Y.%m.%d}/${now:%H%M%S}
+  sweep:
+    dir: exp/sft/${now:%Y.%m.%d}/${now:%H%M%S}

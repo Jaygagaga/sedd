@@ -1,0 +1,15 @@
+defaults:
+  - base
+  - _self_
+  - override hydra/launcher: submitit_slurm
+
+hydra:
+  launcher:
+    max_num_timeout: 100000
+    # timeout_min: 10079
+    partition: g40x
+    account: stanford
+    mem_gb: 96
+    cpus_per_task: 40
+    gpus_per_node: ${ngpus}
+    constraint: null
