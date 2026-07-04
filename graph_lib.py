@@ -225,17 +225,17 @@ class Absorbing(Graph):
         )[..., None]
         return edge
 
-    def sample_transition(self, i, sigma):
+    def sample_transition(self, i, sigma): #基于sigma的条件 random加噪声，得到最终状态的加噪之后的序列
         move_chance = 1 - (-sigma).exp()
         move_indices = torch.rand(*i.shape, device=i.device) < move_chance
         i_pert = torch.where(move_indices, self.dim - 1, i)
         return i_pert
     
-    def staggered_score(self, score, dsigma):
+    def staggered_score(self, score, dsigma): # 在这里做的是把当前噪声层级 σ 的 score 变成 “前一小步噪声层级”的相对权重 p_sigma-dsigma}(z)/p_sigma(x)
         score = score.clone() # yeah yeah whatever we should probably do this
         extra_const = (1 - (dsigma).exp()) * score.sum(dim=-1)
-        score *= dsigma.exp()[:, None]
-        score[..., -1] += extra_const
+        score *= dsigma.exp()[:, None] # 就是 e^{-dσ} 的倒数，表示从当前噪声层级往前回推一小步时，对普通 token 概率/score 需要乘上的恢复因子
+        score[..., -1] += extra_const #从上一步所有普通token流入mask的概率质量
         return score
 
     def sample_limit(self, *batch_dims):

@@ -40,6 +40,11 @@ eval:
   batch_size: 16
   perplexity: False
   answer_extraction: heuristic
+  pretrained_model_path: /root/workspace/sedd_small
+  sft_model_path: null
+  sft_search_root: exp_local/sft
+  models: null
+  max_examples: null
 
 optim:
   lr: 1e-5

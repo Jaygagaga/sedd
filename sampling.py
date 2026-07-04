@@ -82,7 +82,7 @@ class AnalyticPredictor(Predictor):
         score = score_fn(x, curr_sigma)
 
         stag_score = self.graph.staggered_score(score, dsigma)
-        probs = stag_score * self.graph.transp_transition(x, dsigma)
+        probs = stag_score * self.graph.transp_transition(x, dsigma) #后验概率
         return sample_categorical(probs)
 
     

@@ -90,6 +90,92 @@ def trim_generated_text(full_text):
     return full_text.strip()
 
 
+def _find_latest_epoch_checkpoint(checkpoint_dir):
+    if not os.path.isdir(checkpoint_dir):
+        return None
+
+    latest = None
+    pattern = re.compile(r"checkpoint_epoch_(\d+)\.pth$")
+    for name in os.listdir(checkpoint_dir):
+        match = pattern.fullmatch(name)
+        if not match:
+            continue
+        epoch = int(match.group(1))
+        path = os.path.join(checkpoint_dir, name)
+        mtime = os.path.getmtime(path)
+        candidate = (epoch, mtime, path)
+        if latest is None or candidate > latest:
+            latest = candidate
+    return latest[-1] if latest is not None else None
+
+
+def _resolve_checkpoint_in_run_dir(run_dir):
+    if not os.path.isdir(run_dir):
+        return None
+
+    best_checkpoint = os.path.join(run_dir, "checkpoints", "best_checkpoint.pth")
+    if os.path.exists(best_checkpoint):
+        return best_checkpoint
+
+    latest_epoch_checkpoint = _find_latest_epoch_checkpoint(os.path.join(run_dir, "checkpoints"))
+    if latest_epoch_checkpoint is not None:
+        return latest_epoch_checkpoint
+
+    meta_checkpoint = os.path.join(run_dir, "checkpoints-meta", "checkpoint.pth")
+    if os.path.exists(meta_checkpoint):
+        return meta_checkpoint
+
+    hf_bin = os.path.join(run_dir, "pytorch_model.bin")
+    hf_safe = os.path.join(run_dir, "model.safetensors")
+    if os.path.exists(os.path.join(run_dir, "config.json")) and (os.path.exists(hf_bin) or os.path.exists(hf_safe)):
+        return run_dir
+
+    return None
+
+
+def _discover_latest_sft_checkpoint(search_root):
+    if not os.path.exists(search_root):
+        raise FileNotFoundError(f"SFT checkpoint path does not exist: {search_root}")
+
+    if os.path.isfile(search_root):
+        return search_root, os.path.dirname(search_root)
+
+    direct_match = _resolve_checkpoint_in_run_dir(search_root)
+    if direct_match is not None:
+        return direct_match, search_root
+
+    latest = None
+    for root, _, _ in os.walk(search_root):
+        resolved = _resolve_checkpoint_in_run_dir(root)
+        if resolved is None:
+            continue
+        timestamp = os.path.getmtime(resolved if os.path.isfile(resolved) else root)
+        candidate = (timestamp, resolved, root)
+        if latest is None or candidate > latest:
+            latest = candidate
+
+    if latest is None:
+        raise FileNotFoundError(
+            f"No saved SFT checkpoint found under: {search_root}. "
+            "Expected checkpoints-meta/checkpoint.pth or checkpoints/checkpoint_epoch_*.pth."
+        )
+
+    _, resolved_path, run_dir = latest
+    return resolved_path, run_dir
+
+
+def _normalize_model_filter(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        return set(parts) if parts else None
+    if isinstance(value, (list, tuple)):
+        parts = [str(part).strip() for part in value if str(part).strip()]
+        return set(parts) if parts else None
+    return {str(value).strip()}
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="sft")
 def main(cfg):
     hydra_cfg = HydraConfig.get()
@@ -108,17 +194,34 @@ def main(cfg):
         target_field=getattr(cfg.data, "target_field", "solution"),
         answer_field=getattr(cfg.data, "answer_field", None),
         cache_dir=cfg.data.cache_dir,
+        local_path=getattr(cfg.data, "local_path", None),
         max_length=getattr(cfg.data, "max_length", cfg.model.length),
         seed=getattr(cfg.data, "split_seed", 42),
     )
     collate_fn = lambda batch: data.collate_sft_batch(batch, tokenizer.pad_token_id)
     test_loader = torch.utils.data.DataLoader(test_set, batch_size=1, shuffle=False, collate_fn=collate_fn)
 
+    sft_search_root = getattr(cfg.eval, "sft_model_path", None) or getattr(cfg.eval, "sft_search_root", "exp_local/sft")
+    sft_model_path, sft_run_dir = _discover_latest_sft_checkpoint(sft_search_root)
+    logger.info(f"Resolved latest SFT checkpoint: {sft_model_path}")
+    logger.info(f"Resolved SFT run directory: {sft_run_dir}")
+
     model_specs = [
-        ("pretrained_analytic", getattr(cfg.eval, "pretrained_model_path", "louaaron/sedd-small"), "analytic", False),
-        ("sft_analytic", getattr(cfg.eval, "sft_model_path", cfg.work_dir), "analytic", True),
-        ("sft_euler", getattr(cfg.eval, "sft_model_path", cfg.work_dir), "euler", True),
+        ("pretrained_analytic", getattr(cfg.eval, "pretrained_model_path", "/root/workspace/sedd_small"), "analytic", False),
+        ("sft_analytic", sft_model_path, "analytic", True),
+        ("sft_euler", sft_model_path, "euler", True),
     ]
+    model_filter = _normalize_model_filter(getattr(cfg.eval, "models", None))
+    if model_filter is not None:
+        model_specs = [spec for spec in model_specs if spec[0] in model_filter]
+        logger.info(f"Filtered eval models: {sorted(model_filter)}")
+    if not model_specs:
+        raise ValueError("No eval models selected. Check cfg.eval.models.")
+
+    max_examples = getattr(cfg.eval, "max_examples", None)
+    if max_examples is not None:
+        max_examples = int(max_examples)
+        logger.info(f"Debug eval enabled: max_examples={max_examples}")
 
     outputs_dir = os.path.join(work_dir, "eval_outputs")
     utils.makedirs(outputs_dir)
@@ -152,6 +255,8 @@ def main(cfg):
         runtimes = []
 
         for idx, batch in enumerate(test_loader):
+            if max_examples is not None and idx >= max_examples:
+                break
             batch = move_batch_to_device(batch, device)
             start = time.time()
             generated_ids = sampling_fn(model, batch["input_ids"], batch["prompt_mask"], batch["target_mask"])
@@ -184,6 +289,10 @@ def main(cfg):
                 "runtime_sec": elapsed,
             }
             records.append(record)
+            logger.info(
+                f"{name} example={idx} em={em:.0f} rouge_l_f1={rouge:.4f} "
+                f"token_f1={f1:.4f} runtime_sec={elapsed:.2f}"
+            )
 
         metrics = {
             "rouge_l_f1": sum(rouge_scores) / max(len(rouge_scores), 1),
@@ -193,6 +302,9 @@ def main(cfg):
             "avg_runtime_sec": sum(runtimes) / max(len(runtimes), 1),
             "num_examples": len(records),
         }
+        if name.startswith("sft_"):
+            metrics["resolved_model_path"] = sft_model_path
+            metrics["resolved_run_dir"] = sft_run_dir
         results[name] = metrics
 
         with open(os.path.join(outputs_dir, f"{name}_generations.json"), "w") as fout:
