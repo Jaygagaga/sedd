@@ -104,47 +104,201 @@ To train on slurm, simply run
 python train.py -m args
 ```
 
-## Supervised Fine-Tuning Prototype
+## Supervised Fine-Tuning for Conditional Generation
 
-This repository now includes a course-project-style supervised fine-tuning path for conditional generation on question/solution data such as [`simplescaling/s1K-1.1`](https://huggingface.co/datasets/simplescaling/s1K-1.1).
+This fork includes a supervised fine-tuning path for adapting SEDD to question-to-solution generation, with [`simplescaling/s1K-1.1`](https://huggingface.co/datasets/simplescaling/s1K-1.1) as the default dataset. The goal is not to reproduce the original SEDD language-modeling benchmark, but to test whether a discrete diffusion LM can be adapted to conditional reasoning-style generation.
+
+The SFT path is intentionally minimal:
+
+1. Build an input sequence from a prompt field and a target field.
+2. Keep the prompt prefix fixed.
+3. Apply discrete diffusion only to the target suffix.
+4. Train the SEDD ratio-score model with Score Entropy loss on target positions.
+5. Evaluate generated solutions with lexical-overlap metrics and saved per-example generations.
+
+### SFT Data Format
+
+The default SFT dataset fields are:
+
+```text
+prompt_field = question
+target_field = solution
+answer_field = null
+```
+
+For each example, the model sees a formatted conditional sequence:
+
+```text
+Question:
+{question}
+
+Solution:
+{solution}
+```
+
+The prompt part is used as conditioning context. The target part is where noise is applied and where the loss is computed. If the Hugging Face dataset only has a `train` split, the data loader creates deterministic train/validation/test splits using `data.split_seed`.
+
+The main SFT settings live in `configs/sft.yaml`:
+
+```yaml
+data:
+  task_type: sft
+  dataset_name: simplescaling/s1K-1.1
+  prompt_field: question
+  target_field: solution
+  max_length: 512
+  split_seed: 42
+
+training:
+  target_only_diffusion: True
+
+sampling:
+  prompt_clamp: True
+```
+
+If the data is available locally, pass a local parquet file or parquet directory:
+
+```bash
+python train_sft.py data.local_path=/path/to/train-00000-of-00001.parquet
+```
 
 ### Train SFT
 
-The SFT pipeline keeps the prompt prefix fixed and only applies discrete diffusion plus Score Entropy loss to the target suffix.
+Start with the default small debug run:
 
 ```bash
 python train_sft.py
 ```
 
-Important defaults are defined in `configs/sft.yaml`:
-
-- `data.task_type=sft`
-- `data.dataset_name=simplescaling/s1K-1.1`
-- `data.tokenizer_name_or_path=/gpt_tokenizer`
-- `data.local_path=/root/workspace/data/train-00000-of-00001.parquet`
-- `data.prompt_field=question`
-- `data.target_field=solution`
-- `data.max_length=512`
-- `training.target_only_diffusion=True`
-- `sampling.prompt_clamp=True`
-
-Tokenizer loading now prefers a local directory first. By default the code looks for `/gpt_tokenizer`, then a few common local fallbacks, and only then falls back to remote `gpt2`.
-For SFT data, the code now also supports loading a local `.parquet` file or directory of parquet shards directly, without downloading the dataset from Hugging Face.
-
-### Evaluate SFT
-
-To evaluate the pretrained baseline and the SFT model on the held-out split, run
+Useful medium-size training recipes:
 
 ```bash
-python eval_sft.py
+# Medium model, 768-token context.
+python train_sft.py \
+  model=medium \
+  model.length=768 \
+  data.max_length=768 \
+  training.batch_size=16 \
+  hydra.run.dir=/root/shared-storage/sedd_runs/sft_medium_768_b16
+
+# Medium model, 1024-token context.
+python train_sft.py \
+  model=medium \
+  model.length=1024 \
+  data.max_length=1024 \
+  training.batch_size=8 \
+  hydra.run.dir=/root/shared-storage/sedd_runs/sft_medium_1024_b8
 ```
 
-This writes:
+The training script writes checkpoints and lightweight diagnostics under `hydra.run.dir`:
 
-- `eval_outputs/metrics.json`: aggregate `ROUGE-L`, token-level `F1`, exact match, average length, and average runtime
-- `eval_outputs/*_generations.json`: per-example predictions and references
-- `eval_outputs/*_samples.txt`: a few sample generations for reporting
+```text
+checkpoints/best_checkpoint.pth
+checkpoints/checkpoint_epoch_*.pth
+checkpoints-meta/checkpoint.pth
+metrics/loss_history.json
+metrics/loss_history.csv
+samples/epoch_*.txt
+```
 
+The best checkpoint is selected by validation loss.
+
+### Evaluate SFT and Pretrained Baselines
+
+Evaluate a pretrained SEDD baseline plus the latest SFT checkpoint under a run directory:
+
+```bash
+python eval_sft.py \
+  eval.pretrained_model_path=louaaron/sedd-medium \
+  eval.sft_search_root=/root/shared-storage/sedd_runs/sft_medium_1024_b8 \
+  model=medium \
+  model.length=1024 \
+  data.max_length=1024 \
+  sampling.steps=128 \
+  hydra.run.dir=/root/shared-storage/sedd_runs/sft_medium_1024_b8_eval
+```
+
+This evaluates:
+
+```text
+pretrained_analytic
+sft_analytic
+sft_euler
+```
+
+To evaluate only the pretrained model, filter the model list:
+
+```bash
+python eval_sft.py \
+  eval.models=pretrained_analytic \
+  eval.pretrained_model_path=louaaron/sedd-medium \
+  eval.sft_search_root=/root/shared-storage/sedd_runs/sft_medium_1024_b8 \
+  model=medium \
+  model.length=1024 \
+  data.max_length=1024 \
+  sampling.steps=128 \
+  hydra.run.dir=/root/shared-storage/sedd_runs/pretrained_medium_1024_eval
+```
+
+`eval.sft_search_root` still needs to point at an existing SFT run because the evaluator resolves an SFT checkpoint before applying the optional model filter.
+
+Evaluation writes:
+
+```text
+eval_outputs/metrics.json
+eval_outputs/pretrained_analytic_generations.json
+eval_outputs/pretrained_analytic_samples.txt
+eval_outputs/sft_analytic_generations.json
+eval_outputs/sft_analytic_samples.txt
+eval_outputs/sft_euler_generations.json
+eval_outputs/sft_euler_samples.txt
+```
+
+The `*_generations.json` files are the most useful for error analysis. Each record contains:
+
+```text
+index
+generated_text
+reference_text
+pred_answer
+ref_answer
+rouge_l_f1
+token_f1
+exact_match
+runtime_sec
+```
+
+### Metrics
+
+The evaluator reports:
+
+- `ROUGE-L F1`: longest-common-subsequence overlap between generated and reference solution.
+- `token_f1`: bag-of-token overlap between generated and reference solution.
+- `exact_match`: normalized final predicted answer exactly equals the reference answer.
+- `avg_generated_length`: average generated length in tokenizer tokens.
+- `avg_runtime_sec`: average wall-clock generation time per example.
+- `num_examples`: number of evaluated test examples.
+
+For reasoning-style data, `ROUGE-L` and `token_f1` are lexical-overlap indicators. They are useful for comparing runs, but they do not prove mathematical or scientific correctness. Always inspect `*_generations.json` when a run improves only slightly or generates much longer outputs.
+
+### Comparing SFT Runs
+
+A recommended comparison table is:
+
+```text
+pretrained SEDD medium, analytic
+SFT SEDD medium, analytic
+SFT SEDD medium, euler
+SFT SEDD small, analytic
+SFT SEDD small, euler
+```
+
+When reporting results, compare each SFT checkpoint to the pretrained baseline evaluated with the same context length, sampling steps, dataset split, and metric code. A useful interpretation pattern is:
+
+```text
+The SFT checkpoint improves lexical-overlap metrics, but exact match remains low.
+The improvement should therefore be read as better topical/token overlap, not as reliable answer correctness.
+```
 ## Citation
 ```
 @article{lou2024discrete,
@@ -157,3 +311,4 @@ This writes:
 ## Acknowledgements
 
 This repository builds heavily off of [score sde](https://github.com/yang-song/score_sde_pytorch), [plaid](https://github.com/igul222/plaid), and [DiT](https://github.com/facebookresearch/DiT).
+
